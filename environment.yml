@@ -1,0 +1,15 @@
+name: ml-algos
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch-gpu
+  - ca-certificates
+  - openssl
+  - scikit-learn
+  - pandas
+  - jupyter
+  - seaborn
+  - certifi
+  - matplotlib
