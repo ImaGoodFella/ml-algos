@@ -1,6 +1,5 @@
 # Standard Python .gitignores
 .ipynb_checkpoints
-*.csv
 __pycache__/
 
 # Distribution / packaging
@@ -23,3 +22,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+
+# unwanted files
+*.csv
+*.png
