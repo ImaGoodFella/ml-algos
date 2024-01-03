@@ -98,6 +98,7 @@ class KMeans(BaseEstimator, ClusterMixin):
         for i in range(1, self.n_clusters):
             D2 = self.dist_func(init[:i,:], X).amin(dim=0)
             probs = D2 / torch.sum(D2)
+            # https://github.com/pytorch/pytorch/issues/30968 and why I do not just use torch.multinomial(probabs, 1)
             cumprobs = torch.cumsum(probs, dim=0)
             init[i, :] = X[torch.searchsorted(cumprobs, r.sample([1]).to(X.device))]
 
