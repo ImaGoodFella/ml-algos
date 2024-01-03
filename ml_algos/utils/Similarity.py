@@ -42,14 +42,40 @@ def euc_sim_2(a: torch.tensor, b: torch.tensor):
     
     return - (a[:, None] - b[None, :]).square().sum(dim=-1)
 
+def euc_sim_3(a: torch.tensor, b: torch.tensor):  
+    """
+    Compute euclidean similarity of 2 sets of vectors
+
+    Parameters:
+    a: torch.tensor, shape: [m, num_features]
+    b: torch.tensor, shape: [n, num_features]
+
+    Returns: torch.tensor, shape: [m, n]
+    """
+    
+    return -torch.cdist(a[None], b[None], p=2.0)[0]
+
+def euc_dist(a: torch.tensor, b: torch.tensor):  
+    """
+    Compute euclidean similarity of 2 sets of vectors
+
+    Parameters:
+    a: torch.tensor, shape: [m, num_features]
+    b: torch.tensor, shape: [n, num_features]
+
+    Returns: torch.tensor, shape: [m, n]
+    """
+    
+    return torch.cdist(a[None], b[None], p=2.0)[0]
+
 def main():
     from math import isclose
     import time
 
     device = 'cuda'
-    m = 10000
+    m = 100000
     n = m // 5
-    num_features = 150
+    num_features = 100
 
     a = torch.rand(size=(m, num_features), device=device)
     b = torch.rand(size=(n, num_features), device=device)
@@ -62,15 +88,20 @@ def main():
     res_euc = euc_sim(a, b)
     print(-start_time + time.time())
     
+    #start_time = time.time()
+    #res_euc_2 = euc_sim_2(a, b)
+    #print(-start_time + time.time())
+
     start_time = time.time()
-    res_euc_2 = euc_sim_2(a, b)
+    res_euc_3 = euc_sim_3(a, b)
     print(-start_time + time.time())
 
     for i in range(m):
         for j in range(n):
             assert isclose((normalize(a[i,:], dim=0) * normalize(b[j,:], dim=0)).sum(), res_cos[i, j], rel_tol=1e-5)
             assert isclose(-(a[i,:] - b[j,:]).square().sum(), res_euc[i, j], rel_tol=1e-4)
-            assert isclose(res_euc[i, j], res_euc_2[i, j], rel_tol=1e-4)
+            #assert isclose(res_euc[i, j], res_euc_2[i, j], rel_tol=1e-4)
+            assert isclose(res_euc[i, j], - res_euc_3[i, j].square(), rel_tol=1e-4)
 
 # ========================
 # SCRIPT ENTRY

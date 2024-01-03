@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from typing import Union
 
-from ml_algos.utils.Similarity import euc_sim, cos_sim
+from ml_algos.utils.Similarity import euc_sim, euc_dist
 from ml_algos.utils.Memory import find_optimal_splits
 
 # Adapted from https://github.com/DeMoriarty/fast_pytorch_kmeans/blob/master/fast_pytorch_kmeans/kmeans.py
@@ -84,12 +84,24 @@ class KMeans(BaseEstimator, ClusterMixin):
             raise NotImplemented("Algorithm not implemented!")
         
         self.sim_func = euc_sim
+        self.dist_func = euc_dist
         
     def init_random(self, X: torch.Tensor):
         return X[self.rng.choice(X.shape[0], size=self.n_clusters, replace=False).tolist()]
     
     def init_pp(self, X: torch.Tensor):
-        raise NotImplementedError(f"Init method not implemented!")
+
+        init = torch.empty((self.n_clusters, X.shape[1]), device=X.device)
+        init[0,:] = X[torch.randint(X.shape[0], [1]),:]
+
+        r = torch.distributions.uniform.Uniform(0, 1)
+        for i in range(1, self.n_clusters):
+            D2 = self.dist_func(init[:i,:], X).amin(dim=0)
+            probs = D2 / torch.sum(D2)
+            cumprobs = torch.cumsum(probs, dim=0)
+            init[i, :] = X[torch.searchsorted(cumprobs, r.sample([1]).to(X.device))]
+
+        return init
     
     def fit(self, X: torch.Tensor, y: torch.Tensor = None):
         self.fit_predict(X, y)
@@ -122,6 +134,12 @@ class KMeans(BaseEstimator, ClusterMixin):
         
         device = X.device
 
+        self.mean = X.mean(dim=0)
+        if self.copy_x:
+            X = X.clone() - self.mean
+        else:
+            X -= self.mean
+
         if y is None:
             self.centroids = self.init(X)
         else:
@@ -144,6 +162,9 @@ class KMeans(BaseEstimator, ClusterMixin):
 
             self.centroids = c_grad
 
+        self.centroids += self.mean
+        if not self.copy_x: X += self.mean
+
         return closest
     
 
@@ -159,20 +180,21 @@ def main():
     m = 10000
     num_features = 2
 
-    n_clusters = 100
+    n_clusters = 10
     X = torch.rand(size=(m, num_features), device=device)
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, init='random', n_init=1, max_iter=100, copy_x=False)
-    kmeans_sk = KMeans_sk(n_clusters=n_clusters, random_state=42, init='random', n_init=1, max_iter=100, copy_x=False)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, init='k-means++', n_init=1, max_iter=100, copy_x=False)
+    kmeans_sk = KMeans_sk(n_clusters=n_clusters, random_state=42, init='k-means++', n_init=1, max_iter=100, copy_x=False)
 
+    X_numpy = X.cpu().numpy()
     start = time.time()
     for i in range(num_runs):
-        kmeans_sk.fit_predict(X=X.cpu().numpy())
+        kmeans_sk.fit_predict(X=X_numpy)
     duration = time.time() - start
     print(duration)
 
     start = time.time()
     for i in range(num_runs):
-        kmeans.fit_predict(X=X)
+        y = kmeans.fit_predict(X=X)
     duration = time.time() - start
     print(duration)
 
