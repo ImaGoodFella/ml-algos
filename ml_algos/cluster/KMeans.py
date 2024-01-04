@@ -195,9 +195,6 @@ class KMeans(BaseEstimator, ClusterMixin):
 
                 closest = self.get_closest_clusters(X=X, centroids=centroids)
                 c_grad = self.compute_new_clusters(X=X, closest=closest, arranged_mask=arranged_mask)               
-                expanded_closest = closest.repeat(self.n_clusters, 1)
-                mask = (expanded_closest==arranged_mask).to(X.dtype)
-                c_grad = mask @ X / mask.sum(-1)[:,None]
                 
                 error = (c_grad - centroids).square().sum()
                 if prev_err is not None and abs(error - prev_err) < self.tol: break
