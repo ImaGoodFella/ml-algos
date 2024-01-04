@@ -7,6 +7,8 @@ from typing import Union
 from ml_algos.utils.Similarity import euc_sim, euc_dist
 from ml_algos.utils.Memory import find_optimal_splits
 
+from tqdm import tqdm
+
 # Adapted from https://github.com/DeMoriarty/fast_pytorch_kmeans/blob/master/fast_pytorch_kmeans/kmeans.py
 class KMeans(BaseEstimator, ClusterMixin):
     """Pytorch KMeans implementation"""
@@ -21,7 +23,9 @@ class KMeans(BaseEstimator, ClusterMixin):
             verbose: int = 0, 
             random_state: Union[int, None, np.random.RandomState] = None,
             copy_x: bool = True,
-            algorithm: str = "llyod"
+            algorithm: str = "llyod",
+            device: Union[None, str] = None,
+            safe_mode: bool = False
         ):
 
         """
@@ -47,6 +51,10 @@ class KMeans(BaseEstimator, ClusterMixin):
             Copy x before modifying
         algorithm: str = "llyod"
             algorithm
+        device: str = None
+            device to do computation on
+        safe_mode: bool = False
+            whether to allocate memory before computing chunk_size
         """
 
         self.n_clusters = n_clusters
@@ -70,19 +78,16 @@ class KMeans(BaseEstimator, ClusterMixin):
         self.max_iter = max_iter
         self.tol = tol
         self.verbose = verbose
-
-        if isinstance(random_state, int):
-            self.rng = np.random.default_rng(seed=random_state)
-        elif isinstance(random_state, np.random.RandomState):
-            self.rng = random_state
-        else:
-            raise NotImplementedError(f"random_state argument not implemented for type {type(random_state)}")
+        self.random_state = random_state
 
         self.copy_x = copy_x
 
         if algorithm != "llyod":
             raise NotImplemented("Algorithm not implemented!")
         
+        self.device = device
+        self.safe_mode = safe_mode
+
         self.sim_func = euc_sim
         self.dist_func = euc_dist
         
@@ -91,16 +96,16 @@ class KMeans(BaseEstimator, ClusterMixin):
     
     def init_pp(self, X: torch.Tensor):
 
-        init = torch.empty((self.n_clusters, X.shape[1]), device=X.device)
+        init = torch.empty((self.n_clusters, X.shape[1]), device=self.compute_device)
         init[0,:] = X[torch.randint(X.shape[0], [1]),:]
 
         r = torch.distributions.uniform.Uniform(0, 1)
-        for i in range(1, self.n_clusters):
+        for i in tqdm(range(1, self.n_clusters), disable=self.verbose<1):
             D2 = self.dist_func(init[:i,:], X).amin(dim=0)
             probs = D2 / torch.sum(D2)
             # https://github.com/pytorch/pytorch/issues/30968 and why I do not just use torch.multinomial(probabs, 1)
             cumprobs = torch.cumsum(probs, dim=0)
-            init[i, :] = X[torch.searchsorted(cumprobs, r.sample([1]).to(X.device))]
+            init[i, :] = X[torch.searchsorted(cumprobs, r.sample([1]).to(self.compute_device))]
 
         return init
     
@@ -108,32 +113,64 @@ class KMeans(BaseEstimator, ClusterMixin):
         self.fit_predict(X, y)
     
     def predict(self, X : torch.Tensor) -> torch.Tensor:
-        return self.max_sim(a=X, b=self.centroids)
-    
-    def max_sim(self, a : torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return self.get_closest_clusters(X=X, centroids=self.centroids)
         
-        n_samples = a.shape[0]
-        max_sim_i = torch.empty(n_samples, device=a.device, dtype=torch.int64)
+    def get_closest_clusters(self, X : torch.Tensor, centroids: torch.Tensor) -> torch.Tensor:
+        
+        centroids = centroids.to(self.compute_device)
+        n_samples = X.shape[0]
+        max_sim_i = torch.empty(n_samples, device=self.compute_device, dtype=torch.int64)
 
         def get_required_memory(chunk_size):
-            return chunk_size * a.shape[1] * b.shape[0] * a.element_size() + n_samples * 2 * 4
+            return chunk_size * X.shape[1] * centroids.shape[0] * X.element_size() + n_samples * 2 * 4
 
-        splits = find_optimal_splits(n_samples, get_required_memory,device=a.device, safe_mode=True)
+        splits = find_optimal_splits(n_samples, get_required_memory, device=self.compute_device, safe_mode=False)
         chunk_size = math.ceil(n_samples / splits)
 
-        for i in range(splits):
+        for i in tqdm(range(splits), disable=self.verbose<1):
             start = i * chunk_size
             end = min((i + 1) * chunk_size, n_samples)
-            sub_x = a[start:end]
-            sub_sim = self.sim_func(sub_x, b)
+            sub_x = X[start:end].to(self.compute_device)
+            sub_sim = self.sim_func(sub_x, centroids)
             _, sub_max_sim_i = sub_sim.max(dim=-1)
             max_sim_i[start:end] = sub_max_sim_i
 
-        return max_sim_i
+        return max_sim_i.to(X.device)
+
+    def score(self, X: torch.Tensor):
+        return - self.compute_error(X, self.centroids, self.predict(X)).to(X.device)
+    
+    def compute_error(self, X: torch.Tensor, centroids: torch.Tensor, closest: torch.Tensor):
+        return (X - centroids[self.get_closest_clusters(X=X, centroids=centroids)]).square().sum()
+    
+    def compute_new_clusters(self, X: torch.Tensor, closest: torch.Tensor, arranged_mask: torch.Tensor):
+        
+        n_samples = X.shape[0]
+
+        new_centroids = torch.zeros((self.n_clusters, X.shape[1]), device=self.compute_device, dtype=X.dtype)
+        cluster_size = torch.zeros(self.n_clusters, device=self.compute_device, dtype=X.dtype)
+
+        def get_required_memory(chunk_size):
+            return chunk_size * X.shape[1] * self.n_clusters * closest.element_size() * 8
+
+        splits = find_optimal_splits(n_samples, get_required_memory, device=self.compute_device, safe_mode=False)
+        chunk_size = math.ceil(n_samples / splits)
+        
+        for i in tqdm(range(splits), disable=self.verbose<1):
+            start = i * chunk_size
+            end = min((i + 1) * chunk_size, n_samples)
+            expanded_closest = closest[start:end].repeat(self.n_clusters, 1)
+            mask = (expanded_closest==arranged_mask).to(X.dtype)
+            new_centroids += mask @ X[start:end]
+            cluster_size += mask.sum(-1)
+
+        new_centroids /= cluster_size[:,None]
+        return new_centroids
 
     def fit_predict(self, X: torch.Tensor, y: torch.Tensor = None):
+        self.rng = np.random.default_rng(self.random_state)
         
-        device = X.device
+        self.compute_device = X.device
 
         self.mean = X.mean(dim=0)
         if self.copy_x:
@@ -141,32 +178,43 @@ class KMeans(BaseEstimator, ClusterMixin):
         else:
             X -= self.mean
 
-        if y is None:
-            self.centroids = self.init(X)
-        else:
-            self.centroids = y
+        best_error = torch.tensor(float("inf"), device=X.device)
+        best_centroids = None
+        best_closest = None
 
-        closest = None
-        prev_err = None
-        arranged_mask = torch.arange(self.n_clusters, device=device)[:,None]
-        for i in range(self.max_iter):
+        for i in range(self.n_init):
+            if y is None:
+                centroids = self.init(X)
+            else:
+                centroids = y
 
-            closest = self.max_sim(a=X, b=self.centroids)
+            closest = None
+            prev_err = None
+            arranged_mask = torch.arange(self.n_clusters, device=X.device)[:,None]
+            for i in range(self.max_iter):
 
-            expanded_closest = closest.repeat(self.n_clusters, 1)
-            mask = (expanded_closest==arranged_mask).to(X.dtype)
-            c_grad = mask @ X / mask.sum(-1)[:,None]
+                closest = self.get_closest_clusters(X=X, centroids=centroids)
+                c_grad = self.compute_new_clusters(X=X, closest=closest, arranged_mask=arranged_mask)               
+                expanded_closest = closest.repeat(self.n_clusters, 1)
+                mask = (expanded_closest==arranged_mask).to(X.dtype)
+                c_grad = mask @ X / mask.sum(-1)[:,None]
+                
+                error = (c_grad - centroids).square().sum()
+                if prev_err is not None and abs(error - prev_err) < self.tol: break
+                prev_err = error
 
-            error = (c_grad - self.centroids).square().sum()
-            if prev_err is not None and abs(error - prev_err): break
-            prev_err = error
+                centroids = c_grad
 
-            self.centroids = c_grad
+            error = self.compute_error(X, centroids, closest)
+            if error < best_error:
+                best_error = error
+                best_centroids = centroids
+                best_closest = closest
 
-        self.centroids += self.mean
+        self.centroids = best_centroids + self.mean
         if not self.copy_x: X += self.mean
 
-        return closest
+        return best_closest
     
 
 def main():
@@ -176,27 +224,30 @@ def main():
     from sklearn.cluster import KMeans as KMeans_sk
     import time
     
-    num_runs = 100
+    num_runs = 1
     device = 'cuda'
-    m = 10000
-    num_features = 2
+    compute_device = 'cuda'
+    m = 100000
+    num_features = 10000
 
-    n_clusters = 10
+    n_clusters = 1000
     X = torch.rand(size=(m, num_features), device=device)
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, init='k-means++', n_init=1, max_iter=100, copy_x=False)
-    kmeans_sk = KMeans_sk(n_clusters=n_clusters, random_state=42, init='k-means++', n_init=1, max_iter=100, copy_x=False)
-
-    X_numpy = X.cpu().numpy()
-    start = time.time()
-    for i in range(num_runs):
-        kmeans_sk.fit_predict(X=X_numpy)
-    duration = time.time() - start
-    print(duration)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, init='random', n_init=1, max_iter=100, copy_x=False, verbose=0, device=compute_device)
+    kmeans_sk = KMeans_sk(n_clusters=n_clusters, random_state=42, init='random', n_init=1, max_iter=100, copy_x=False)
 
     start = time.time()
     for i in range(num_runs):
         y = kmeans.fit_predict(X=X)
     duration = time.time() - start
+    print(kmeans.score(X=X))
+    print(duration)
+
+    X_numpy = X.cpu().numpy()
+    start = time.time()
+    for i in range(num_runs):
+        kmeans_sk.fit(X=X_numpy)
+    duration = time.time() - start
+    print(kmeans_sk.score(X=X_numpy))
     print(duration)
 
     centroids = kmeans.centroids.cpu().numpy()
